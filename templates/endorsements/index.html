@@ -1,0 +1,44 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>旧保单批单沿革核对</title>
+  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+</head>
+<body>
+  <header class="topbar">
+    <h1>旧保单批单沿革核对</h1>
+    <nav>
+      <button data-view="documents">材料清单</button>
+      <button data-view="relations">沿革关系</button>
+      <button data-view="checks">核查问题 <span id="issue-badge" class="badge zero">0</span></button>
+      <button data-view="query">按日期核对</button>
+      <button data-view="history">留痕 / 撤销</button>
+    </nav>
+    <div class="spacer"></div>
+    <button id="undo-btn" class="btn-sm"
+            style="background:#fff;color:#115e63;border:none;">↩ 撤销误录</button>
+  </header>
+
+  <main>
+    <noscript>本应用需要启用 JavaScript。</noscript>
+    <div id="view-root"></div>
+  </main>
+
+  <div id="toast" class="hidden"></div>
+
+  <script src="{% static 'js/api.js' %}"></script>
+  <script src="{% static 'js/viewer.js' %}"></script>
+  <script src="{% static 'js/modal.js' %}"></script>
+  <script src="{% static 'js/app.js' %}"></script>
+  <script src="{% static 'js/forms.js' %}"></script>
+  <script src="{% static 'js/query.js' %}"></script>
+  <script src="{% static 'js/history.js' %}"></script>
+  <script>
+    window.App = App;
+    document.addEventListener("DOMContentLoaded", () => App.init());
+  </script>
+</body>
+</html>

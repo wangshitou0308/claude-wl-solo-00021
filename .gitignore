@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+/media/scans/
+/media/.gitkeep
+.DS_Store
+*.log
