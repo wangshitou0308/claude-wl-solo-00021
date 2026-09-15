@@ -49,12 +49,18 @@ def _dump(obj) -> dict:
         val = f.value_from_object(obj)
         if hasattr(val, "isoformat"):
             val = val.isoformat()
-        elif f.name in ("scan",) and obj.scan:
-            val = obj.scan.name
+        elif f.name == "scan":
+            # 无文件时 value_from_object 给出空 ImageFieldFile，
+            # 必须转成 None/文件名，否则 JSON 快照无法序列化
+            val = obj.scan.name or None
         data[f.name] = val
     if isinstance(obj, Relation):
         data["affected_paragraph_ids"] = list(
             obj.affected_paragraphs.values_list("id", flat=True))
+    if isinstance(obj, ClauseParagraph):
+        # 段落删除时记下它挂在哪些关系上，撤销恢复时重新挂回
+        data["relation_ids"] = list(
+            obj.relations.values_list("id", flat=True))
     return data
 
 
@@ -99,8 +105,13 @@ def update_with_audit(entity_type: str, obj, fields: dict, *,
 def soft_delete_with_audit(entity_type: str, obj):
     _guard_relation_lock(obj)
     before = _dump(obj)
+    if isinstance(obj, ClauseParagraph):
+        # 从局部替换关系上摘下，避免软删后被悬空检查报错；
+        # 关系 id 已记入快照，撤销删除时会重新挂回
+        obj.relations.clear()
     obj.deleted = True
-    obj.save(update_fields=["deleted", "updated_at"])
+    fields = ["deleted"] + (["updated_at"] if hasattr(obj, "updated_at") else [])
+    obj.save(update_fields=fields)
     log_action("delete", entity_type, obj.pk,
                f"删除{entity_type} #{obj.pk}", before)
     if entity_type == "relation":
@@ -108,9 +119,10 @@ def soft_delete_with_audit(entity_type: str, obj):
 
 
 def hard_delete_region_with_audit(region: EvidenceRegion):
+    before = _dump(region)
     rid = region.pk
     region.delete()
-    log_action("delete", "region", rid, f"删除框选 #{rid}", None)
+    log_action("delete", "region", rid, f"删除框选 #{rid}", before)
 
 
 def set_relation_locked(relation: Relation, locked: bool):
@@ -139,26 +151,58 @@ def undo_last() -> AuditLog:
             raise LookupError("待撤销的对象已不存在")
         _guard_relation_lock(obj)
         if entry.entity_type == "region":
+            # 框选是硬删除撤销的逆操作；创建本身只需要把框选删掉
             obj.delete()
         else:
             obj.deleted = True
-            obj.save(update_fields=["deleted", "updated_at"])
+            fields = ["deleted"] + (["updated_at"]
+                                    if hasattr(obj, "updated_at") else [])
+            obj.save(update_fields=fields)
         if entry.entity_type == "relation":
             invalidate_downstream(obj, deleting=True)
 
     elif entry.action == "delete":
-        obj = model.all_objects.filter(pk=entry.entity_id).first()
-        if obj is None:
-            raise LookupError("待恢复的对象已不存在")
-        obj.deleted = False
-        obj.save(update_fields=["deleted", "updated_at"])
+        if entry.entity_type == "region":
+            # 框选原本是硬删除，按快照重建
+            obj = EvidenceRegion(pk=entry.entity_id, **{
+                k: v for k, v in (entry.snapshot or {}).items()
+                if k in {f.name for f in EvidenceRegion._meta.concrete_fields
+                         if f.name not in ("id",)}})
+            obj.save(force_insert=True)
+        else:
+            obj = model.all_objects.filter(pk=entry.entity_id).first()
+            if obj is None:
+                raise LookupError("待恢复的对象已不存在")
+            obj.deleted = False
+            fields = ["deleted"] + (["updated_at"]
+                                    if hasattr(obj, "updated_at") else [])
+            obj.save(update_fields=fields)
+            if entry.entity_type == "paragraph":
+                # 恢复软删时从关系上摘下的段落引用
+                for rid in (entry.snapshot or {}).get("relation_ids") or []:
+                    r = Relation.all_objects.filter(pk=rid).first()
+                    if r is not None:
+                        r.affected_paragraphs.add(obj)
         if entry.entity_type == "relation":
             invalidate_downstream(obj)
 
     elif entry.action == "update":
-        obj = model.all_objects.filter(pk=entry.entity_id).first()
-        if obj is None:
-            raise LookupError("待回滚的对象已不存在")
+        if entry.entity_type == "region":
+            obj = EvidenceRegion.objects.filter(
+                pk=entry.entity_id).first()
+            if obj is None and entry.snapshot:
+                # 极端情况下框选已被物理删除，按旧快照重建
+                obj = EvidenceRegion(pk=entry.entity_id, **{
+                    k: v for k, v in entry.snapshot.items()
+                    if k in {f.name for f in EvidenceRegion._meta.concrete_fields
+                             if f.name not in ("id",)}})
+                obj.save(force_insert=True)
+            if obj is None:
+                raise LookupError("待回滚的框选已不存在")
+        else:
+            obj = model.all_objects.filter(pk=entry.entity_id).first()
+            if obj is None:
+                raise LookupError("待回滚的对象已不存在")
         _guard_relation_lock(obj)
         _restore_snapshot(obj, entry.snapshot)
         if entry.entity_type == "relation":
@@ -177,13 +221,34 @@ def undo_last() -> AuditLog:
 
 def _restore_snapshot(obj, snap: dict):
     m2m = snap.pop("affected_paragraph_ids", None)
-    field_names = {f.name for f in obj._meta.concrete_fields}
+    relation_ids = snap.pop("relation_ids", None)
+    field_map = {f.name: f for f in obj._meta.concrete_fields}
     for k, v in snap.items():
-        if k in field_names:
-            setattr(obj, k, v)
+        if k not in field_map:
+            continue
+        field = field_map[k]
+        if isinstance(v, str) and field.__class__.__name__ in (
+                "DateField", "DateTimeField") and v:
+            from datetime import datetime
+            try:
+                v = datetime.fromisoformat(v)
+                if field.__class__.__name__ == "DateField":
+                    v = v.date()
+            except ValueError:
+                pass
+        if k == "scan" and isinstance(v, str):
+            # ImageField 直接赋文件名即可（文件仍在 media 下）
+            obj.scan.name = v
+            continue
+        setattr(obj, k, v)
     obj.save()
     if m2m is not None and isinstance(obj, Relation):
         obj.affected_paragraphs.set(m2m)
+    if relation_ids is not None and isinstance(obj, ClauseParagraph):
+        for rid in relation_ids:
+            r = Relation.all_objects.filter(pk=rid).first()
+            if r is not None:
+                r.affected_paragraphs.add(obj)
 
 
 # --------------------------------------------------------------------------- #
@@ -217,10 +282,13 @@ def dependency_fingerprint(payload: dict) -> tuple[str, dict]:
                     rid = int(t.split(":")[1])
                     deps_by_clause[name].add(rid)
         for gap in payload.get("gaps", []):
-            if gap.get("clause") == name:
-                for rid, r in rel_stamps.items():
-                    if r["kind"] in ("revoke_version", "revoke_relation"):
-                        deps_by_clause[name].add(rid)
+            if gap.get("clause") != name:
+                continue
+            vid = gap.get("version_id")
+            # 精确：只依赖"撤销了该缺口版本"的撤销关系
+            for r in rel_stamps.values():
+                if r["kind"] == "revoke_version" and r["to_id"] == vid:
+                    deps_by_clause[name].add(r["id"])
 
     stamps = sorted(
         (rid, (rel_stamps.get(rid, {}).get("deleted", True)))
@@ -248,68 +316,75 @@ def save_conclusion(query_date, payload) -> QueryConclusion:
         payload=payload, dependency_hash=fp)
 
 
-def invalidate_downstream(relation: Relation, *, deleting: bool = False):
+def invalidate_downstream(relation: Relation | None = None, *,
+                          deleting: bool = False,
+                          clause_names: set[str] | None = None,
+                          date_gate=None,
+                          relation_id: int | None = None,
+                          reason: str = ""):
     """
-    关系变化后，仅让受影响条款的已存结论过期。
+    精确失效：只标记真正可能改变的已存结论为过期。
 
-    受影响条款 = 关系两端版本所属条款，并沿 replace/partial 边
-    （新版本→旧版本方向）向下游传播；撤销关系穿透到其目标关系。
+    两条判据（取并集）：
+    A. 结论依赖中包含本关系 id（撤销修改时含其目标关系 id）；
+    B. 结论条款名与本关系两端版本所属条款相交（覆盖新增关系，
+       或关系改了指向、使旧结论依赖清单不再完整的情形）。
+
+    日期门控：关系只能影响"不早于其最早可能发生日"的核对结论，
+    query_date < date_earliest 的结论绝不判过期；日期完全不清时不过滤。
     """
     dataset = serializers.build_dataset()
     versions = {v["id"]: v for v in dataset["versions"]}
     relations = dataset["relations"]
 
-    seeds: set[int] = set()
-    rdata = next((r for r in relations if r["id"] == relation.pk), None)
-    if rdata:
+    rid = relation.pk if relation is not None else relation_id
+    rdata = next((r for r in relations if r["id"] == rid), None)
+
+    gate = date_gate
+    affected_names: set[str] = set(clause_names or [])
+    direct_ids: set[int] = {rid}
+
+    snap = None
+    if rdata is None:
+        # 已删除：取最近一次删除/修改快照
+        log = AuditLog.objects.filter(
+            entity_type="relation", entity_id=rid).order_by("-id").first()
+        if log and log.snapshot:
+            snap = log.snapshot
+
+    if rdata is not None:
         for vid in (rdata["from_id"], rdata["to_id"]):
             if vid in versions:
-                seeds.add(vid)
-        if rdata["kind"] == "revoke_relation":
-            t = next((r for r in relations
-                      if r["id"] == rdata["target_relation_id"]), None)
+                affected_names.add(versions[vid]["clause_name"])
+        if rdata["kind"] == "revoke_relation" and rdata["target_relation_id"]:
+            direct_ids.add(rdata["target_relation_id"])
+            t = next((x for x in relations
+                      if x["id"] == rdata["target_relation_id"]), None)
             if t:
                 for vid in (t["from_id"], t["to_id"]):
                     if vid in versions:
-                        seeds.add(vid)
-    else:
-        # 删除时无法从新数据集定位：尝试审计快照
-        log = AuditLog.objects.filter(
-            entity_type="relation", entity_id=relation.pk).order_by("-id").first()
-        if log and log.snapshot:
-            for key in ("from_version_id", "to_version_id"):
-                vid = log.snapshot.get(key)
-                if vid in versions:
-                    seeds.add(vid)
+                        affected_names.add(versions[vid]["clause_name"])
+        gate = gate or rdata["date_lo"]
+    elif snap:
+        for key in ("from_version_id", "to_version_id"):
+            vid = snap.get(key)
+            if vid in versions:
+                affected_names.add(versions[vid]["clause_name"])
+        if snap.get("kind") == "revoke_relation" and snap.get(
+                "target_relation_id"):
+            direct_ids.add(snap["target_relation_id"])
+        gate = gate or snap.get("date_earliest")
 
-    # 沿 incoming（旧→新）反向找上游 + outgoing（新→旧）下游：
-    # 结论可能建立在任一侧，传播到整条连通分量最稳妥
-    adj: dict[int, set[int]] = defaultdict(set)
-    for r in relations:
-        if r["kind"] in ("replace", "partial", "supplement") \
-                and r["from_id"] and r["to_id"]:
-            adj[r["from_id"]].add(r["to_id"])
-            adj[r["to_id"]].add(r["from_id"])
-    affected_versions: set[int] = set()
-    stack = list(seeds)
-    while stack:
-        cur = stack.pop()
-        if cur in affected_versions:
-            continue
-        affected_versions.add(cur)
-        stack.extend(adj[cur] - affected_versions)
-
-    clause_names = {versions[v]["clause_name"] for v in affected_versions
-                    if v in versions}
-    if not clause_names:
-        return
-    qs = QueryConclusion.objects.filter(stale=False)
-    for concl in qs:
+    verb = "删除" if deleting else "修改"
+    for concl in QueryConclusion.objects.filter(stale=False):
+        if gate is not None and concl.query_date < gate:
+            continue  # 关系最早也在该结论日期之后，结论不可能受影响
         deps = (concl.payload or {}).get("_dependencies", {})
-        if clause_names & set(deps.keys()):
+        dep_ids = {rid for ids in deps.values() for rid in ids}
+        hit_direct = bool(direct_ids & dep_ids)
+        hit_clause = bool(affected_names & set(deps.keys()))
+        if hit_direct or hit_clause:
             concl.stale = True
-            concl.stale_reason = (
-                f"关系 #{relation.pk} 被" +
-                ("删除" if deleting else "修改") +
-                "，相关条款结论需重新生成")
+            concl.stale_reason = reason or (
+                f"关系 #{rid} 被{verb}，相关条款结论需重新生成")
             concl.save(update_fields=["stale", "stale_reason", "updated_at"])

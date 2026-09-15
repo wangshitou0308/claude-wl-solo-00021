@@ -12,7 +12,10 @@ def document_dict(d: SourceDocument) -> dict:
         "file_no": d.file_no,
         "title": d.title,
         "kind": d.kind,
+        # 前端统一读 scan；scan_url 保留给交接件/内部使用
+        "scan": d.scan.url if d.scan else None,
         "scan_url": d.scan.url if d.scan else None,
+        "scan_name": d.scan.name if d.scan else None,
         "issued_lo": d.issued_earliest,
         "issued_hi": d.issued_latest,
         "start_lo": d.effective_start_earliest,
@@ -32,6 +35,7 @@ def paragraph_dict(p: ClauseParagraph) -> dict:
         "text": p.text,
         "order": p.order,
         "version_id": p.version_id,
+        "deleted": p.deleted,
     }
 
 

@@ -38,8 +38,11 @@ def _body(request) -> dict:
 
 
 def _dates(payload: dict, names) -> dict:
+    """仅转换 payload 中【实际出现】的日期字段；未提交的字段保持原值。"""
     out = {}
     for name in names:
+        if name not in payload:
+            continue
         val = payload.get(name)
         if isinstance(val, str) and val:
             try:
@@ -196,14 +199,26 @@ def document_detail(request, pk):
     if "file_no" in payload:
         fields["file_no"] = payload["file_no"].strip()
     try:
-        fields.update(_dates({k: v for k, v in payload.items()
-                              if k in DATE_FIELDS_DOC}, DATE_FIELDS_DOC))
+        fields.update(_dates(payload, DATE_FIELDS_DOC))
     except ValueError as e:
         return _err(str(e))
     scan = request.FILES.get("scan") if hasattr(request, "FILES") else None
     if scan:
         fields["scan"] = scan
-    doc = services.update_with_audit("document", doc, fields)
+    try:
+        doc = services.update_with_audit("document", doc, fields)
+    except Exception as e:
+        return _err(str(e))
+    # 材料签发/生效区间变化可能改变全部相关结论
+    if set(fields) & set(DATE_FIELDS_DOC):
+        related = set(ClauseVersion.all_objects.filter(
+            document_id=doc.id).values_list("clause_name", flat=True))
+        services.invalidate_downstream(
+            None, clause_names=related,
+            gate=min((doc.issued_earliest, doc.effective_start_earliest),
+                     key=lambda x: x or date.max),
+            relation_id=None,
+            reason=f"材料 {doc.file_no} 的日期被修改，相关结论需重新生成")
     return _ok(document=_document_json(doc))
 
 
@@ -308,15 +323,12 @@ def paragraphs(request):
 
 @require_http_methods(["PATCH", "DELETE"])
 def paragraph_detail(request, pk):
-    p = ClauseParagraph.objects.filter(pk=pk).first()
+    p = ClauseParagraph.all_objects.filter(pk=pk).first()
     if p is None:
         raise Http404("段落不存在")
     if request.method == "DELETE":
-        pid = p.pk
         clause = p.version.clause_name
-        p.delete()
-        services.log_action("delete", "paragraph", pid,
-                            f"删除段落 #{pid}", None)
+        services.soft_delete_with_audit("paragraph", p)
         QueryConclusion.objects.filter(stale=False).update(
             stale=True, stale_reason=f"版本「{clause}」段落被删除，结论需重新生成")
         return _ok()
@@ -385,6 +397,7 @@ def relations(request):
             id__in=ids, version_id=r.from_version_id))
     services.log_action("create", "relation", r.pk,
                         f"录入关系 #{r.pk}（{r.get_kind_display()}）", None)
+    services.invalidate_downstream(r, reason=f"新增关系 #{r.pk}，相关条款结论需重新生成")
     return _ok(relation=_relation_json(Relation.objects.select_related(
         "document", "from_version", "to_version",
         "target_relation").get(pk=r.pk)))
@@ -408,7 +421,10 @@ def relation_detail(request, pk):
                            .filter(target__startswith=f"relation:{pk}")]
         return _ok(**data)
     if request.method == "DELETE":
-        services.soft_delete_with_audit("relation", r)
+        try:
+            services.soft_delete_with_audit("relation", r)
+        except services.LockedError as e:
+            return _err(str(e), status=409)
         return _ok()
 
     payload = _body(request)
@@ -420,9 +436,8 @@ def relation_detail(request, pk):
         if key in payload:
             val = payload[key]
             fields[key] = int(val) if val else None
-    fields.update(_dates({k: v for k, v in payload.items()
-                          if k in DATE_FIELDS_REL}, DATE_FIELDS_REL))
     try:
+        fields.update(_dates(payload, DATE_FIELDS_REL))
         r = services.update_with_audit("relation", r, fields,
                                        relation_changed=True)
         if "affected_paragraph_ids" in payload:

@@ -92,6 +92,7 @@ class ClauseParagraph(models.Model):
     """
     条款版本下的段落。局部替换按 paragraph_no 对齐；
     未被替换关系涉及的段落始终沿用旧文 —— 系统绝不静默抹去。
+    段落同样软删除，以便"撤销误录"完整恢复（包括关系上的段落引用）。
     """
 
     version = models.ForeignKey(ClauseVersion, verbose_name="所属版本",
@@ -101,12 +102,17 @@ class ClauseParagraph(models.Model):
     title = models.CharField("段落标题", max_length=200, blank=True)
     text = models.TextField("段落文本", blank=True)
     order = models.PositiveIntegerField("顺序", default=0)
+    deleted = models.BooleanField("已删除（误录撤销）", default=False, db_index=True)
+
+    objects = SoftDeleteManager()
+    all_objects = models.Manager()
 
     class Meta:
         verbose_name = "条款段落"
         verbose_name_plural = verbose_name
         ordering = ["version_id", "order", "id"]
-        unique_together = [("version", "paragraph_no")]
+        # 同号校验放在业务层（软删条目不占用"名额"，撤销删除时可完整恢复）
+        indexes = [models.Index(fields=["version", "deleted"])]
 
     def __str__(self):
         return f"{self.version_id}/{self.paragraph_no}"
